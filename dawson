@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+ 
+# Dependencies :
+# - argparse         : CLI arguments
+# - requests         : Fetch stats from Hacker News & Github
+# - asyncio          : Execution loop (desktop_notifier requirement)
+# - time             : Thread sleep
+# - copy             : Deep copy
+# - desktop_notifier : Cross-OS notifications
+# - datetime         : Timestamped logs
+# - platform         : Detect whether we are on Mac OS
+# - webbrowser       : Open a URL in the web browser
+# - signal           : Event loop management (graceful termination)
+# - rubicon          : Event loop management (click on notification) on Mac OS
+import argparse
+import requests
+import asyncio
+import time
+import copy
+from desktop_notifier import DesktopNotifier, Urgency, Button, ReplyField, DEFAULT_SOUND
+from datetime import datetime
+import platform
+import webbrowser
+import signal
+
+# Mac OS 
+try:
+    from rubicon.objc.eventloop import EventLoopPolicy
+except:
+    pass
+
+# Prints an error and a recommendation when the supplied URL argument is in the wrong format
+def print_error_url():
+    print("Please copy-paste a working link to the resource you'd like to monitor")
+    print("It should look like, either : ")
+    print("- https://news.ycombinator.com/item?id=<ID>")
+    print("- https://github.com/<AUTHOR>/<REPOSITORY>")
+
+# Prints an error when we can't retrieve stats from the Github API
+def print_error_github():
+    print("We weren't able to retrieve the statistics of your Github repository")
+    print("Please make sure that the repository is publicly accessible")
+    print("Also, you may consider using the argument -T <TOKEN> to increase the number of requests we can send")
+
+# Prints a log line with a timestamp
+def print_log(log, quiet):
+    if quiet:
+        return
+    print(f"{datetime.today().strftime('%Y-%m-%d %H:%M:%S')} >> {log}")
+
+# Entry point
+async def main():
+    # Args management
+    parser = argparse.ArgumentParser(
+        prog='dawson',
+        description="Dawson is a tiny utility that enables you to track your project's submission on Hacker News, and your project's repository on Github.\nOn every new comment, upvote, fork, issue, or star, Dawson will send you a desktop notification so you can quickly react and anticipate.",
+        epilog='License: MIT\nAuthor: Will Moss',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('-u', '--url', required=True)
+    parser.add_argument('-m', '--max', type=int, required=False, default=1, help="The maximum number of notifications shown in the notification center", metavar='<X>')
+    parser.add_argument('-f', '--frequency', type=float, required=False, default=10, help="The frequency, in seconds, used to check for new statistics", metavar='<X>')
+    parser.add_argument('-s', '--silent', action='store_true', required=False, default=False, help="Disable the sound of notifications")
+    parser.add_argument('-q', '--quiet', action='store_true', required=False, default=False, help="Disable the output of log lines in the console")
+    parser.add_argument('-t', '--title', required=False, default="Dawson - Activity recorded", help="The title shown in the notifications", metavar='<X>')
+    parser.add_argument('-T', '--token', required=False, help="The Github token used to circumvent API rate limits", metavar='<X>')
+
+
+    # Args parsing - With graceful shutdown on Mac OS
+    if platform.system() == 'Darwin':
+        try:
+            args = parser.parse_args()
+        except:
+            return
+    else:
+        args = parser.parse_args()
+
+    # Notifications management
+    notifier = DesktopNotifier(
+        app_name='Dawson',
+        notification_limit=args.max,
+    )
+
+    # Async management - Graceful termination
+    async_stop_event = asyncio.Event()
+    async_loop       = asyncio.get_running_loop()
+
+    async_loop.add_signal_handler(signal.SIGINT,  async_stop_event.set)
+    async_loop.add_signal_handler(signal.SIGTERM, async_stop_event.set)
+
+    # Checks before startup
+
+    # - Domain
+    if 'news.ycombinator.com' not in args.url and 'github.com' not in args.url:
+        print_error_url()
+        exit(1)
+
+    # - Hacker News format
+    if 'news.ycombinator.com' in args.url:
+        if len(args.url.split('?id=')) != 2:
+            print_error_url()
+            exit(1)
+
+    # - Github format
+    elif 'github.com' in args.url:
+        if len(list(filter(None, args.url.split('github.com/')[1].split('/')))) < 2:
+            print_error_url()
+            exit(1)
+
+    # - Frequency
+
+    # Actual monitoring loop
+    monitoring_type = 'hackernews' if 'news.ycombinator.com' in args.url else 'github'
+    print_log('Monitoring : Start', args.quiet)
+
+    previous_metrics = {}
+    while not async_stop_event.is_set():
+        should_notify = False
+
+        # Monitoring : Hacker News
+        if monitoring_type == 'hackernews':
+            resource_id   = args.url.split('?id=')[1]
+            resource_url  = f"https://hacker-news.firebaseio.com/v0/item/{resource_id}.json"
+            resource_data = requests.get(resource_url).json()
+
+            new_metrics = { 'score': resource_data['score'], 'comments': resource_data['descendants'] }
+
+        # Monitoring : Github
+        elif monitoring_type == 'github':
+            resource_id   = '/'.join(args.url.split('github.com/')[1].split('/')[0:2])
+            resource_url  = f"https://api.github.com/repos/{resource_id}"
+
+            headers = {}
+            if args.token:
+                headers['Authorization'] = f'Bearer {args.token}'
+
+            resource_data = requests.get(resource_url, headers=headers).json()
+
+            if 'id' not in resource_data:
+                print_error_github()
+                exit(1)
+
+            new_metrics = { 'stars': resource_data['stargazers_count'], 'forks': resource_data['forks_count'], 'issues': resource_data['open_issues_count'] }
+
+        # Guard : Initialize metrics on first run
+        if len(previous_metrics) == 0:
+            previous_metrics = copy.deepcopy(new_metrics)
+            continue
+
+        # Determine whether a notification should be sent
+        for k in new_metrics:
+            if previous_metrics[k] != new_metrics[k]:
+                should_notify = True
+                break
+
+        # Notification
+        if should_notify:
+            print_log('Monitoring : New activity', args.quiet)
+            previous_metrics = copy.deepcopy(new_metrics)
+
+            lines = [ f"{k.capitalize()}: {v}" for k, v in previous_metrics.items() ]
+            message = "\n".join(lines)
+
+            await notifier.send(
+                title=args.title,
+                message=message,
+                sound=DEFAULT_SOUND if not args.silent else None,
+                on_clicked=lambda: webbrowser.open(args.url, new=0, autoraise=True)
+            )
+
+        await asyncio.sleep(args.frequency)
+
+    print_log('Monitoring : End', args.quiet)
+
+# Specific setup to handle click on notifications on Mac OS
+if platform.system() == 'Darwin':
+    asyncio.set_event_loop_policy(EventLoopPolicy())
+
+asyncio.run(main())
