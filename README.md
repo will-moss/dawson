@@ -10,6 +10,8 @@
     </p>
 </p>
 
+<img src="/assets/SCREENSHOT.png" alt="Dawson" />
+
 ## Table of Contents
 
 - [Introduction](#introduction)
